@@ -1,0 +1,92 @@
+name: Dependabot auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip updates that are not minor or patch
+        if: >-
+          steps.metadata.outputs.update-type != 'version-update:semver-minor'
+          && steps.metadata.outputs.update-type != 'version-update:semver-patch'
+        env:
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+        run: echo "Leaving this pull request open (update type '${UPDATE_TYPE}'). Semver-major updates stay for a human."
+
+      - name: Squash-merge after CI succeeds
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+          || steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Merge only after .github/workflows/ci.yml succeeds for this head.
+          # This repository does not expose required status checks, so
+          # `gh pr merge --auto` would not wait for that workflow.
+          deadline=$((SECONDS + 1800))
+          while (( SECONDS < deadline )); do
+            pr=$(gh pr view "$PR_URL" --json headRefOid,state --jq '[.headRefOid, .state] | @tsv')
+            head_now=${pr%%$'\t'*}
+            state=${pr#*$'\t'}
+            if [[ "$head_now" != "$HEAD_SHA" ]]; then
+              echo "Head moved to ${head_now}; a newer run will handle it."
+              exit 0
+            fi
+            if [[ "$state" != "OPEN" ]]; then
+              echo "Pull request is ${state}."
+              exit 0
+            fi
+
+            summary=$(gh run list \
+              --workflow ci.yml \
+              --commit "$HEAD_SHA" \
+              --event pull_request \
+              --limit 1 \
+              --json status,conclusion \
+              --jq 'if length == 0 then "missing" else "\(.[0].status):\(.[0].conclusion // "pending")" end')
+            echo "CI ${summary}"
+
+            case "$summary" in
+              completed:success)
+                gh pr merge --squash "$PR_URL"
+                exit 0
+                ;;
+              completed:*)
+                echo "CI did not succeed (${summary})."
+                exit 1
+                ;;
+              missing | *:*)
+                sleep 15
+                ;;
+              *)
+                echo "Unexpected CI status: ${summary}"
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "Timed out waiting for CI on ${HEAD_SHA}."
+          exit 1
